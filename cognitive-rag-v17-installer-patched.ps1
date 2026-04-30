@@ -20,6 +20,12 @@ $ErrorActionPreference = "Stop"
 #   [FIX-11] ingest.py persist() removed (Chroma auto-persists now)
 #   [FIX-12] Extension httpPost GPU status uses correct GET method
 #   [FIX-13] FIM endpoint gracefully handles models w/o FIM support
+#   [FIX-14] OCR: easyocr (CRAFT+CRNN, CPU) primary; pix2tex for LaTeX
+#            formula regions; moondream demoted to last-resort fallback
+#   [FIX-15] api.py verbatim OCR prepend — LLM cannot paraphrase OCR
+#   [FIX-16] api.py memory suppression for OCR queries (no pollution)
+#   [FIX-17] Extension: auto-start, 60s watchdog, refusal detection,
+#            multi-turn history, agent bridge on :8766 (/agent-query)
 # ================================================================
 
 $ROOT   = "$HOME\cognitive-rag-v17"
@@ -104,7 +110,7 @@ try {
     $tags = Invoke-RestMethod "http://localhost:11434/api/tags" -TimeoutSec 6
     $all  = @($tags.models | ForEach-Object { $_.name })
     Write-Host "   Models: $($all -join ', ')" -ForegroundColor DarkCyan
-    $candidates = @("qwen2.5-coder:7b","qwen2.5-coder:14b","deepseek-coder-v2:16b","qwen3.6:latest","codellama:7b")
+    $candidates = @("qwen3:latest","qwen2.5-coder:7b","qwen2.5-coder:14b","deepseek-coder-v2:16b","codellama:7b")
     foreach ($c in $candidates) {
         $hit = $all | Where-Object { $_ -eq $c } | Select-Object -First 1
         if ($hit) { $MODEL = $hit; break }
@@ -180,9 +186,17 @@ Step "Installing packages (batch 3/3 - document loaders + dev tools)"
     pytest-asyncio
 if ($LASTEXITCODE -ne 0) { Warn "Batch 3 had errors" } else { OK "Batch 3 done" }
 
+Step "Installing packages (batch 4/4 - OCR + audio transcription)"
+& $PIP install --quiet `
+    Pillow `
+    easyocr `
+    pix2tex `
+    faster-whisper
+if ($LASTEXITCODE -ne 0) { Warn "Batch 4 had errors" } else { OK "Batch 4 done" }
+
 # Verify critical packages
 Step "Verifying critical packages"
-$criticalPkgs = @("fastapi","uvicorn","chromadb","langchain","ollama","pytest")
+$criticalPkgs = @("fastapi","uvicorn","chromadb","langchain","ollama","pytest","easyocr","faster_whisper")
 foreach ($pkg in $criticalPkgs) {
     $check = & $PY -c "import $($pkg.Replace('-','_')); print('ok')" 2>&1
     if ($check -eq "ok") { OK "$pkg OK" } else { Warn "$pkg MISSING - $check" }
@@ -550,6 +564,39 @@ def _get_easyocr_reader():
         _easyocr_reader = _easyocr.Reader(["en"], gpu=False, verbose=False)
     return _easyocr_reader
 
+# Cached pix2tex LatexOCR model (loaded once on first math OCR use)
+_pix2tex_model = None
+
+def _get_pix2tex_model():
+    global _pix2tex_model
+    if _pix2tex_model is None:
+        from pix2tex.cli import LatexOCR
+        _pix2tex_model = LatexOCR()
+    return _pix2tex_model
+
+_MATH_SIGNALS = re.compile(
+    r'[∑∏∫√∞±≈≠≤≥αβγδεζθλμπρσφψω]'
+    r'|[A-Za-z]\s*[\(\[]\s*\d'
+    r'|\b(exp|ln|log|sin|cos|tan|lim|sum|int|frac|sqrt|nabla)\b'
+    r'|\d+\s*[²³⁴⁵⁶⁷⁸⁹ⁿ]'
+    r'|\^[\{\d]'
+    r'|[\+\-\*\/=]\s*[A-Za-z]\s*[\(\[]'
+    r'|dimensionless|Fibonacci|Equation|Framework|Unified|entropy',
+    re.IGNORECASE
+)
+_FORMULA_SIGNALS = re.compile(
+    r'[=\+\*/^]'
+    r'|[A-Za-z]\([A-Za-z0-9_,]+\)'
+    r'|[A-Za-z]\^[\d\{]'
+    r'|\d+\s*/\s*\d+'
+    r'|[∑∏∫√∞±≈≠≤≥αβγδεζθλμπρσφψω]'
+    r'|\\\w+\{',
+    re.IGNORECASE
+)
+
+def _is_math_heavy(text: str) -> bool:
+    return len(_MATH_SIGNALS.findall(text)) >= 3
+
 def _strip_html(raw: str) -> str:
     raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
     raw = re.sub(r"<style[^>]*>.*?</style>",   "", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -717,7 +764,7 @@ def _bing_scrape(query: str, n=5) -> list:
         return []
 
 def _ocr_image(img_url: str) -> str:
-    """Download an image and extract text using easyocr (primary) or moondream (fallback)."""
+    """Download an image and extract text using easyocr (primary) + pix2tex (LaTeX) or moondream (fallback)."""
     try:
         import requests as _req, base64
         r = _req.get(img_url, timeout=10, verify=False,
@@ -727,16 +774,78 @@ def _ocr_image(img_url: str) -> str:
         ct = r.headers.get("Content-Type", "")
         if not any(t in ct for t in ("image/", "jpeg", "png", "gif", "webp")):
             return ""
-        # --- Primary: easyocr (real character-level OCR) ---
+        # --- Primary: easyocr with upscaling + contrast + pix2tex LaTeX pass ---
         try:
             import numpy as _np
-            from PIL import Image as _PILImage
+            from PIL import Image as _PILImage, ImageEnhance as _IE, ImageFilter as _IF
             import io as _io
             img = _PILImage.open(_io.BytesIO(r.content)).convert("RGB")
-            results = _get_easyocr_reader().readtext(_np.array(img), detail=0)
-            text = " ".join(results).strip()
-            if text:
-                return text
+            w, h = img.size
+            if w < 1200:
+                scale = max(2, 1200 // w)
+                img = img.resize((w * scale, h * scale), _PILImage.LANCZOS)
+            img = img.filter(_IF.SHARPEN)
+            img = _IE.Contrast(img).enhance(1.5)
+            arr = _np.array(img)
+            results = _get_easyocr_reader().readtext(
+                arr, detail=1, paragraph=False, width_ths=0.7, height_ths=0.5)
+            if results:
+                results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+                lines, cur_line, cur_y = [], [], None
+                for bbox, word, _conf in results:
+                    y_c = (bbox[0][1] + bbox[2][1]) / 2
+                    if cur_y is None or abs(y_c - cur_y) < 20:
+                        cur_line.append(word)
+                        cur_y = y_c if cur_y is None else (cur_y + y_c) / 2
+                    else:
+                        lines.append(" ".join(cur_line))
+                        cur_line = [word]; cur_y = y_c
+                if cur_line:
+                    lines.append(" ".join(cur_line))
+                text = "\n".join(lines).strip()
+                if text and _is_math_heavy(text):
+                    try:
+                        _latex_parts = []
+                        img_w, img_h = img.size
+                        clusters, cur_cluster, cur_y = [], [], None
+                        for item in results:
+                            bbox, word, conf = item
+                            y_c = (bbox[0][1] + bbox[2][1]) / 2
+                            if cur_y is None or abs(y_c - cur_y) < 60:
+                                cur_cluster.append(item)
+                                cur_y = y_c if cur_y is None else (cur_y + y_c) / 2
+                            else:
+                                clusters.append(cur_cluster); cur_cluster = [item]; cur_y = y_c
+                        if cur_cluster:
+                            clusters.append(cur_cluster)
+                        for cluster in clusters:
+                            words = [w for _, w, _ in cluster]
+                            math_ratio = sum(1 for w in words if _FORMULA_SIGNALS.search(w)) / max(len(words), 1)
+                            if math_ratio < 0.5:
+                                continue
+                            xs = [p[0] for b, _, _ in cluster for p in b]
+                            ys = [p[1] for b, _, _ in cluster for p in b]
+                            pad = 14
+                            x0, y0 = max(0, int(min(xs))-pad), max(0, int(min(ys))-pad)
+                            x1, y1 = min(img_w, int(max(xs))+pad), min(img_h, int(max(ys))+pad)
+                            if (x1-x0) < 20 or (y1-y0) < 12:
+                                continue
+                            crop = img.crop((x0, y0, x1, y1))
+                            if crop.height < 32:
+                                crop = crop.resize((crop.width*2, crop.height*2), _PILImage.LANCZOS)
+                            try:
+                                latex = _get_pix2tex_model()(crop)
+                                if latex and len(latex.strip()) > 4:
+                                    _latex_parts.append(latex.strip())
+                            except Exception:
+                                pass
+                        if _latex_parts:
+                            text = (text + "\n\n[LaTeX (pix2tex — formula regions)]\n"
+                                    + "\n".join(_latex_parts))
+                    except Exception:
+                        pass
+                if text:
+                    return text
         except Exception:
             pass
         # --- Fallback: moondream vision model ---
@@ -1160,17 +1269,16 @@ async def query(req: Q):
         except Exception as e:
             tool_context += f"\n\n[Web search failed: {e}]"
     # ── Intent: image OCR ────────────────────────────────────────────────────
+    _ocr_raw = []
     if _direct_img_urls:
         from workers.websearch import _ocr_image
         for _img_url in _direct_img_urls[:3]:  # max 3 images per query
             try:
                 _ocr_text = await asyncio.to_thread(_ocr_image, _img_url)
                 if _ocr_text:
-                    tool_context += f"\n\n[OCR: {_ocr_text}]\n(source: {_img_url})"
+                    _ocr_raw.append((_img_url, _ocr_text))
                     if "ocr" not in tools_used:
                         tools_used.append("ocr")
-                else:
-                    tool_context += f"\n\n[OCR returned no text for {_img_url}]"
             except Exception as e:
                 tool_context += f"\n\n[OCR ERROR for {_img_url}: {type(e).__name__}: {e}]"
     # ── Intent: audio transcription ─────────────────────────────────────────────
@@ -1241,23 +1349,25 @@ async def query(req: Q):
         pass
 
     # ── Memory context ────────────────────────────────────────────────────────
-    hits    = mem_search(req.query, n=3)
+    # Skip memory when OCR is running — stale OCR answers corrupt verbatim results.
+    # Double guard: also suppress on OCR-intent phrases in case URL regex misses edge cases.
+    _OCR_INTENT = _re.compile(
+        r'(what|read|transcribe|extract|show|give me).*text.*(?:image|img|photo|pic|screenshot)'
+        r'|text.*(?:in|of|from|on).*(?:this|the).*(?:image|img|photo|pic|screenshot)'
+        r'|(?:image|img|photo|pic|screenshot).*text',
+        _re.I
+    )
+    _suppress_memory = bool(_direct_img_urls) or bool(_OCR_INTENT.search(req.query))
+    hits    = [] if _suppress_memory else mem_search(req.query, n=3)
     mem_ctx = "\n".join(json.dumps(h) for h in hits) if hits else "none"
 
     # ── Build grounded prompt and call model ──────────────────────────────────
-    # Web-status line: tell the model EXACTLY what happened this call
-    if "web" in tools_used:
-        web_status = (
-            "Web search RAN this call — results are injected below. "
-            "Summarise what was found; if content was sparse (e.g. images only), say so honestly."
-        )
-    else:
-        web_status = (
-            "Web search did NOT run this call — no URL or web keyword was detected in the query. "
-            "This system CAN fetch live web pages when a URL (https://…) or search keyword is "
-            "present. Do NOT say you lack web access. If the user is asking about a website, "
-            "tell them to include the URL in their next message and you will fetch it."
-        )
+    _web_st = (
+        "Web search RAN — results injected below. Summarize what was found. "
+        "Never say you lack web access."
+        if "web" in tools_used else
+        "Web search did NOT run this call. To fetch a live URL include it in the query."
+    )
     _audio_st = (
         "Audio transcription RAN — the FULL transcript is injected below. "
         "Report it faithfully; do not say you cannot transcribe audio."
@@ -1267,8 +1377,9 @@ async def query(req: Q):
     )
     _ocr_st = (
         "Image OCR RAN — the extracted text is in [OCR: ...] blocks below. "
-        "Your ONLY job is to copy that text into your answer VERBATIM. "
-        "Do NOT say the image could not be processed. Do NOT add explanations or next-steps."
+        "The verbatim text is already prepended to your response automatically — do NOT repeat it. "
+        "Your job is to answer the user's question ABOUT the text, or summarize/analyze it if asked. "
+        "Do NOT say the image could not be processed."
         if "ocr" in tools_used else
         "Image OCR is available for .png/.jpg/.jpeg/.gif/.webp URLs. "
         "Do NOT claim you cannot read or transcribe images."
@@ -1277,13 +1388,13 @@ async def query(req: Q):
         "You are a Cognitive RAG assistant with autonomous tool capabilities. "
         "ALL context below was gathered by ACTUALLY running the relevant tools — "
         "web results, audio transcripts, OCR text, diagnosis data, and docs are REAL outputs, not placeholders.\n"
-        f"Web: {web_status}\n"
+        f"Web: {_web_st}\n"
         f"Audio: {_audio_st}\n"
         f"OCR: {_ocr_st}\n"
         "CRITICAL OUTPUT RULES:\n"
         "1. If [Audio transcript ...] is present: copy the actual transcript text into your answer.\n"
-        "2. If [OCR: ...] blocks are present: your answer MUST start with the OCR text copied VERBATIM. "
-        "Do not paraphrase. Do not say processing failed. Do not add 'Next Steps'. Just output the text.\n"
+        "2. If [OCR: ...] blocks are present: the verbatim text is ALREADY prepended to your response "
+        "automatically — do NOT repeat it. Answer the user's question about the content, or confirm what the text says.\n"
         "3. If [Audio transcription ERROR: ...] appears: report the exact error to the user.\n"
         "4. If [Audio transcription TIMED OUT]: tell the user the file is very large and suggest the /transcribe endpoint.\n"
         "5. Never say you cannot access the internet, visit URLs, transcribe audio, or read images.\n"
@@ -1311,8 +1422,18 @@ async def query(req: Q):
             {"role": "user",   "content": user_msg}
         ])
 
-    mem_write({"event": "query", "query": req.query, "reasoning": answer,
-               "tools": tools_used, "memory_hits": len(hits)})
+    # ── Verbatim OCR prepend (bypasses LLM — always accurate) ────────────────
+    if _ocr_raw:
+        verbatim_blocks = []
+        for _url, _txt in _ocr_raw:
+            verbatim_blocks.append(f"```\n{_txt}\n```")
+        ocr_header = "**Extracted text (verbatim OCR):**\n" + "\n\n".join(verbatim_blocks)
+        answer = ocr_header + "\n\n---\n\n" + answer
+
+    # Don't write OCR answers to memory — image-specific results pollute future retrieval.
+    if "ocr" not in tools_used and not _direct_img_urls:
+        mem_write({"event": "query", "query": req.query, "reasoning": answer,
+                   "tools": tools_used, "memory_hits": len(hits)})
     STATE["cycle"] += 1
     return {
         "answer":       answer,
