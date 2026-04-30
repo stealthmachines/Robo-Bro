@@ -1,5 +1,3 @@
-<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/b82968a1-373f-4d30-949f-2ac5ee0bb552" />
-
 # Cognitive RAG v17
 
 A self-maintaining local AI assistant with retrieval-augmented generation, persistent memory, image OCR, audio transcription, and live web search — running entirely on your own hardware via Ollama.
@@ -233,6 +231,8 @@ docker compose -f searxng-compose.yml up -d
 The backend automatically prefers SearXNG on `http://localhost:8080` over Brave/DDG when available.
 
 ---
+
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/b82968a1-373f-4d30-949f-2ac5ee0bb552" />
 
 ## License
 
