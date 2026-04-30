@@ -120,12 +120,14 @@ async def query(req: Q):
         except Exception as e:
             tool_context += f"\n\n[Web search failed: {e}]"
     # ── Intent: image OCR ────────────────────────────────────────────────────
+    _ocr_raw: list[tuple[str, str]] = []  # (url, text) — bypasses LLM for verbatim output
     if _direct_img_urls:
         from workers.websearch import _ocr_image
         for _img_url in _direct_img_urls[:3]:  # max 3 images per query
             try:
                 _ocr_text = await asyncio.to_thread(_ocr_image, _img_url)
                 if _ocr_text:
+                    _ocr_raw.append((_img_url, _ocr_text))
                     tool_context += f"\n\n[OCR: {_ocr_text}]\n(source: {_img_url})"
                     if "ocr" not in tools_used:
                         tools_used.append("ocr")
@@ -221,8 +223,9 @@ async def query(req: Q):
     )
     _ocr_st = (
         "Image OCR RAN — the extracted text is in [OCR: ...] blocks below. "
-        "Your ONLY job is to copy that text into your answer VERBATIM. "
-        "Do NOT say the image could not be processed. Do NOT add explanations or next-steps."
+        "The verbatim text is already prepended to your response automatically — do NOT repeat it. "
+        "Your job is to answer the user's question ABOUT the text, or summarize/analyze it if asked. "
+        "Do NOT say the image could not be processed."
         if "ocr" in tools_used else
         "Image OCR is available for .png/.jpg/.jpeg/.gif/.webp URLs. "
         "Do NOT claim you cannot read or transcribe images."
@@ -236,8 +239,8 @@ async def query(req: Q):
         f"OCR: {_ocr_st}\n"
         "CRITICAL OUTPUT RULES:\n"
         "1. If [Audio transcript ...] is present: copy the actual transcript text into your answer.\n"
-        "2. If [OCR: ...] blocks are present: your answer MUST start with the OCR text copied VERBATIM. "
-        "Do not paraphrase. Do not say processing failed. Do not add 'Next Steps'. Just output the text.\n"
+        "2. If [OCR: ...] blocks are present: the verbatim text is ALREADY prepended to your response "
+        "automatically — do NOT repeat it. Answer the user's question about the content, or confirm what the text says.\n"
         "3. If [Audio transcription ERROR: ...] appears: report the exact error to the user.\n"
         "4. If [Audio transcription TIMED OUT]: tell the user the file is very large and suggest the /transcribe endpoint.\n"
         "5. Never say you cannot access the internet, visit URLs, transcribe audio, or read images.\n"
@@ -264,6 +267,15 @@ async def query(req: Q):
             *history_msgs,
             {"role": "user",   "content": user_msg}
         ])
+
+    # ── Verbatim OCR prepend (bypasses LLM — always accurate) ────────────────
+    # The LLM's job is analysis/context; raw extracted text is injected directly.
+    if _ocr_raw:
+        verbatim_blocks = []
+        for _url, _txt in _ocr_raw:
+            verbatim_blocks.append(f"```\n{_txt}\n```")
+        ocr_header = "**Extracted text (verbatim OCR):**\n" + "\n\n".join(verbatim_blocks)
+        answer = ocr_header + "\n\n---\n\n" + answer
 
     mem_write({"event": "query", "query": req.query, "reasoning": answer,
                "tools": tools_used, "memory_hits": len(hits)})
