@@ -229,13 +229,56 @@ def _ocr_image(img_url: str) -> str:
         # --- Primary: easyocr (real character-level OCR) ---
         try:
             import numpy as _np
-            from PIL import Image as _PILImage
+            from PIL import Image as _PILImage, ImageEnhance as _IE, ImageFilter as _IF
             import io as _io
+
             img = _PILImage.open(_io.BytesIO(r.content)).convert("RGB")
-            results = _get_easyocr_reader().readtext(_np.array(img), detail=0)
-            text = " ".join(results).strip()
-            if text:
-                return text
+
+            # Upscale small images — easyocr CRAFT needs ≥ ~800px wide to resolve
+            # math superscripts and subscripts reliably
+            w, h = img.size
+            if w < 1200:
+                scale = max(2, 1200 // w)
+                img = img.resize((w * scale, h * scale), _PILImage.LANCZOS)
+
+            # Sharpen + boost contrast — helps with low-quality forum screenshots
+            img = img.filter(_IF.SHARPEN)
+            img = _IE.Contrast(img).enhance(1.5)
+
+            arr = _np.array(img)
+            # detail=1 → returns (bbox, text, confidence) tuples so we can sort
+            results = _get_easyocr_reader().readtext(
+                arr,
+                detail=1,
+                paragraph=False,        # paragraph=True merges aggressively and loses math structure
+                width_ths=0.7,          # allow wider horizontal merging of character clusters
+                height_ths=0.5,
+            )
+
+            if results:
+                # Sort by top-left y then x (reading order: top→bottom, left→right)
+                results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+
+                # Group into lines: boxes whose y-centres are within 20px of each other
+                # are on the same line; join with space, separate lines with newline
+                lines = []
+                cur_line = []
+                cur_y = None
+                for bbox, word, _conf in results:
+                    y_centre = (bbox[0][1] + bbox[2][1]) / 2
+                    if cur_y is None or abs(y_centre - cur_y) < 20:
+                        cur_line.append(word)
+                        cur_y = y_centre if cur_y is None else (cur_y + y_centre) / 2
+                    else:
+                        lines.append(" ".join(cur_line))
+                        cur_line = [word]
+                        cur_y = y_centre
+                if cur_line:
+                    lines.append(" ".join(cur_line))
+
+                text = "\n".join(lines).strip()
+                if text:
+                    return text
         except Exception:
             pass
 
