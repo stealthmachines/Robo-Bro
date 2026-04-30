@@ -546,7 +546,8 @@ def _get_easyocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None:
         import easyocr as _easyocr
-        _easyocr_reader = _easyocr.Reader(["en"], gpu=True, verbose=False)
+        # Force CPU — GPU is occupied by Ollama (RTX 2060 shared)
+        _easyocr_reader = _easyocr.Reader(["en"], gpu=False, verbose=False)
     return _easyocr_reader
 
 def _strip_html(raw: str) -> str:

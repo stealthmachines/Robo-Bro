@@ -3,6 +3,8 @@ const vscode = require("vscode");
 const http   = require("http");
 const https  = require("https");
 const path   = require("path");
+const cp     = require("child_process");
+const fs     = require("fs");
 
 // â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function cfg(key)      { return vscode.workspace.getConfiguration("cognitiveRag").get(key); }
@@ -487,12 +489,33 @@ async function handleChatRequest(request, _context, stream, token) {
     stream.markdown(`\n\n---\n*Tools used: ${used.join(", ")}*`);
     toolBadges.push(...used);
   } catch (err) {
-    // Backend unreachable — show a clear error instead of a silent, toolless fallback
+    // Backend unreachable — attempt auto-restart then surface a clear error
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (ws) {
+      stream.markdown("**⚠️ Backend offline — attempting auto-start…**\n\n");
+      await ensureServerRunning(ws);
+      // Retry the query once after auto-start
+      try {
+        const result2 = await httpPost(ragUrl(), "/query",
+          { query: req.prompt, history: [] });
+        const answer2 = result2.answer || "(no answer)";
+        const toolMap2 = { web: "Web search", docs: "Hybrid RAG",
+                           diagnosis: "Self-Diagnosis", audio: "Audio transcription",
+                           ocr: "Image OCR" };
+        const used2 = (result2.tools_used || []).map(t => toolMap2[t] || t);
+        if (result2.memory_hits > 0) used2.push(`Memory (${result2.memory_hits})`);
+        used2.push("Model: " + model());
+        stream.markdown(answer2);
+        stream.markdown(`\n\n---\n*Tools used: ${used2.join(", ")}*`);
+        toolBadges.push(...used2);
+        return;
+      } catch {}
+    }
     stream.markdown(
       "**⚠️ Cognitive RAG backend is offline** (could not reach `http://localhost:8765`).\n\n" +
       "Audio transcription, web search, OCR, and all agentic tools require the backend.\n\n" +
-      "**To restart:** run `start_server.ps1` in the `cognitive-rag-v17` folder, " +
-      "then retry your query.\n\n" +
+      "**Auto-start attempted** — if it still fails, check that the workspace folder " +
+      "contains a `.venv` directory.\n\n" +
       `*Error: ${err.message}*`
     );
     toolBadges.push("Backend OFFLINE");
@@ -583,8 +606,61 @@ function registerSidebar(context) {
   );
 }
 
-// â”€â”€ activate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Auto-start backend server ────────────────────────────────────────────────
+let _serverProc = null;
+
+async function _checkHealth(url) {
+  return new Promise(resolve => {
+    const parsed = new URL(url + "/health");
+    const lib    = parsed.protocol === "https:" ? https : http;
+    const req    = lib.get({ hostname: parsed.hostname, port: parsed.port || 80,
+                             path: parsed.pathname, timeout: 2000 }, res => {
+      resolve(res.statusCode === 200);
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+  });
+}
+
+async function ensureServerRunning(wsRoot) {
+  if (await _checkHealth(ragUrl())) return; // already up
+
+  const candidates = [
+    path.join(wsRoot, ".venv", "Scripts", "python.exe"),  // Windows venv
+    path.join(wsRoot, ".venv", "bin", "python"),           // Unix venv
+  ];
+  const pyExe = candidates.find(p => fs.existsSync(p));
+  if (!pyExe) {
+    vscode.window.showWarningMessage(
+      "Cognitive RAG: backend not running and .venv not found in workspace. " +
+      "Run start_server.ps1 manually.");
+    return;
+  }
+
+  vscode.window.showInformationMessage("Cognitive RAG: starting backend server…");
+  _serverProc = cp.spawn(pyExe,
+    ["-m", "uvicorn", "server.api:app", "--host", "0.0.0.0", "--port", "8765"],
+    { cwd: wsRoot, detached: false, stdio: "ignore" });
+  _serverProc.on("error", err =>
+    vscode.window.showErrorMessage("Cognitive RAG: failed to start server: " + err.message));
+
+  // Poll health up to 25 s
+  for (let i = 0; i < 25; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    if (await _checkHealth(ragUrl())) {
+      vscode.window.showInformationMessage("Cognitive RAG: backend ready ✓");
+      return;
+    }
+  }
+  vscode.window.showWarningMessage("Cognitive RAG: server started but health check timed out.");
+}
+
+// ─── activate ─────────────────────────────────────────────────────────────────
 function activate(context) {
+  // Auto-start the backend if it's not already running
+  const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (wsRoot) ensureServerRunning(wsRoot);
+
   registerInlineCompletions(context);
 
   if (vscode.chat && vscode.chat.createChatParticipant) {
@@ -660,5 +736,7 @@ function activate(context) {
   );
 }
 
-function deactivate() {}
+function deactivate() {
+  if (_serverProc) { _serverProc.kill(); _serverProc = null; }
+}
 module.exports = { activate, deactivate };
