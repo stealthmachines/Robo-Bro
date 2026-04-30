@@ -204,7 +204,8 @@ async def query(req: Q):
         pass
 
     # ── Memory context ────────────────────────────────────────────────────────
-    hits    = mem_search(req.query, n=3)
+    # Skip memory when OCR is running — stale OCR answers corrupt verbatim results
+    hits    = [] if _direct_img_urls else mem_search(req.query, n=3)
     mem_ctx = "\n".join(json.dumps(h) for h in hits) if hits else "none"
 
     # ── Build grounded prompt and call model ──────────────────────────────────
@@ -277,8 +278,10 @@ async def query(req: Q):
         ocr_header = "**Extracted text (verbatim OCR):**\n" + "\n\n".join(verbatim_blocks)
         answer = ocr_header + "\n\n---\n\n" + answer
 
-    mem_write({"event": "query", "query": req.query, "reasoning": answer,
-               "tools": tools_used, "memory_hits": len(hits)})
+    # Don't write OCR answers to memory — image-specific results pollute future retrieval
+    if "ocr" not in tools_used:
+        mem_write({"event": "query", "query": req.query, "reasoning": answer,
+                   "tools": tools_used, "memory_hits": len(hits)})
     STATE["cycle"] += 1
     return {
         "answer":       answer,

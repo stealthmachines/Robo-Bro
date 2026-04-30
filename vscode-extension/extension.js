@@ -497,7 +497,7 @@ async function handleChatRequest(request, _context, stream, token) {
       // Retry the query once after auto-start
       try {
         const result2 = await httpPost(ragUrl(), "/query",
-          { query: req.prompt, history: [] });
+          { query: query, history: [] });
         const answer2 = result2.answer || "(no answer)";
         const toolMap2 = { web: "Web search", docs: "Hybrid RAG",
                            diagnosis: "Self-Diagnosis", audio: "Audio transcription",
