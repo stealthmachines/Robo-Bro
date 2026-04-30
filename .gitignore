@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Chroma vector databases (runtime data)
+chroma_db/
+memory/chroma_mem/
+memory/cognition.jsonl
+
+# VS Code
+.vscode/
+
+# Environment / secrets
+.env
+*.env
+*.key
+*.pem
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp

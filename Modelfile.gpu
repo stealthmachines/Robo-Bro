@@ -1,0 +1,6 @@
+﻿FROM qwen3:latest
+PARAMETER num_ctx 32768
+PARAMETER num_thread 8
+# NOTE: qwen3:latest = Qwen3-8B (5.2GB), fits in VRAM on RTX 2060 12GB.
+# To use Qwen3-30B-A3B MoE (qwen3.6:latest, 23GB): reboot first to clear
+# CUDA fragmentation, then change FROM to qwen3.6:latest and rebuild.

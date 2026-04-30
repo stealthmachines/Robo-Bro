@@ -1,0 +1,141 @@
+{
+  "name": "cognitive-rag-v17",
+  "displayName": "Cognitive RAG v17",
+  "description": "Local Qwen/Ollama + Hybrid RAG + Repo Graph + Inline Completions + GPU offload",
+  "version": "1.7.0",
+  "publisher": "yourname",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourname/cognitive-rag-v17"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "rag",
+    "ollama",
+    "qwen",
+    "local ai",
+    "copilot",
+    "fim",
+    "inline completion",
+    "gpu"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:cognitiveRag.sidebar",
+    "onCommand:cognitiveRag.openChat",
+    "onCommand:cognitiveRag.repoTask",
+    "onCommand:cognitiveRag.ingestDocs",
+    "onCommand:cognitiveRag.runTests",
+    "onChatParticipant:cognitiveRag.chat"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Cognitive RAG",
+      "properties": {
+        "cognitiveRag.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama API base URL"
+        },
+        "cognitiveRag.ragApiUrl": {
+          "type": "string",
+          "default": "http://localhost:8765",
+          "description": "RAG backend API URL"
+        },
+        "cognitiveRag.model": {
+          "type": "string",
+          "default": "cograg-gpu",
+          "description": "Ollama model name"
+        },
+        "cognitiveRag.inlineEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline ghost-text completions (FIM)"
+        },
+        "cognitiveRag.inlineDelay": {
+          "type": "number",
+          "default": 350,
+          "description": "Debounce ms before triggering inline completion"
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "cognitiveRag.chat",
+        "name": "rag",
+        "fullName": "Cognitive RAG",
+        "description": "Local RAG + Ollama coding assistant",
+        "isSticky": false
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cognitiveRag",
+          "title": "Cognitive RAG",
+          "icon": "media/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "cognitiveRag": [
+        {
+          "type": "webview",
+          "id": "cognitiveRag.sidebar",
+          "name": "Cognitive RAG",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cognitiveRag.openChat",
+        "title": "Cognitive RAG: Open Chat (@rag)",
+        "category": "Cognitive RAG"
+      },
+      {
+        "command": "cognitiveRag.repoTask",
+        "title": "Cognitive RAG: Run Repo Task",
+        "category": "Cognitive RAG"
+      },
+      {
+        "command": "cognitiveRag.ingestDocs",
+        "title": "Cognitive RAG: Re-ingest Documents",
+        "category": "Cognitive RAG"
+      },
+      {
+        "command": "cognitiveRag.runTests",
+        "title": "Cognitive RAG: Run Test Suite",
+        "category": "Cognitive RAG"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "cognitiveRag.openChat",
+        "key": "ctrl+alt+q",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "cognitiveRag.repoTask",
+        "key": "ctrl+alt+r",
+        "when": "editorTextFocus"
+      }
+    ]
+  },
+  "scripts": {
+    "package": "npx @vscode/vsce package --no-dependencies",
+    "install-local": "npm install && npm run package && code --install-extension cognitive-rag-v17-1.7.0.vsix"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.32.0"
+  }
+}

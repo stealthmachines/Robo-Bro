@@ -1,0 +1,16 @@
+﻿# Optional: self-hosted web search (much better than DDG fallback)
+# Usage:
+#   docker compose -f searxng-compose.yml up -d
+#   $env:SEARXNG_URL = "http://localhost:8888"
+#   Then restart start_server.ps1
+version: "3"
+services:
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng-data:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888
+    restart: unless-stopped
