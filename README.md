@@ -232,6 +232,8 @@ The backend automatically prefers SearXNG on `http://localhost:8080` over Brave/
 
 ---
 
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/b82968a1-373f-4d30-949f-2ac5ee0bb552" />
+
 ## License
 
 See [LICENSE](LICENSE).
