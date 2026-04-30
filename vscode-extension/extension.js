@@ -479,6 +479,31 @@ async function handleChatRequest(request, _context, stream, token) {
   try {
     const result  = await httpPost(ragUrl(), "/query", { query, history: chatHistory });
     const answer  = result.answer || "(no answer)";
+
+    // Detect LLM refusal — model fell back to training ("cannot access images/internet").
+    // This means OCR/tools didn't run. Treat as a recoverable failure: restart + retry.
+    const _REFUSAL = /cannot (access|view|browse|read|visit)|unable to (access|view|browse|read)|don't have (the ability|access)|can't (access|view|read)|no (internet|web) access/i;
+    if (_REFUSAL.test(answer) && !result.tools_used?.includes("ocr") && !result.tools_used?.includes("web")) {
+      const ws2 = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (ws2) {
+        stream.markdown("*⚠️ Model returned a refusal — checking server and retrying…*\n\n");
+        await ensureServerRunning(ws2);
+        try {
+          const retry = await httpPost(ragUrl(), "/query", { query, history: [] });
+          const ra = retry.answer || "(no answer)";
+          const rUsed = (retry.tools_used || []).map(t =>
+            ({ web:"Web search", docs:"Hybrid RAG", diagnosis:"Self-Diagnosis",
+               audio:"Audio transcription", ocr:"Image OCR" })[t] || t);
+          if (retry.memory_hits > 0) rUsed.push(`Memory (${retry.memory_hits})`);
+          rUsed.push("Model: " + model());
+          stream.markdown(ra);
+          stream.markdown(`\n\n---\n*Tools used: ${rUsed.join(", ")}*`);
+          toolBadges.push(...rUsed);
+          return;
+        } catch {}
+      }
+    }
+
     const toolMap = { web: "Web search", docs: "Hybrid RAG",
                        diagnosis: "Self-Diagnosis", audio: "Audio transcription",
                        ocr: "Image OCR" };
@@ -660,6 +685,18 @@ function activate(context) {
   // Auto-start the backend if it's not already running
   const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (wsRoot) ensureServerRunning(wsRoot);
+
+  // Watchdog: silently restart the server if it goes down after initial start.
+  // Runs every 60 s; no user-visible message unless restart is needed.
+  const _watchdog = setInterval(async () => {
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!ws) return;
+    if (!(await _checkHealth(ragUrl()))) {
+      vscode.window.showWarningMessage("Cognitive RAG: backend went offline — restarting…");
+      await ensureServerRunning(ws);
+    }
+  }, 60000);
+  context.subscriptions.push({ dispose: () => clearInterval(_watchdog) });
 
   registerInlineCompletions(context);
 
