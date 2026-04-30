@@ -1,3 +1,5 @@
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/b82968a1-373f-4d30-949f-2ac5ee0bb552" />
+
 # Cognitive RAG v17
 
 A self-maintaining local AI assistant with retrieval-augmented generation, persistent memory, image OCR, audio transcription, and live web search — running entirely on your own hardware via Ollama.
