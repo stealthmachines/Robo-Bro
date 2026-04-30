@@ -10,11 +10,13 @@ A self-maintaining local AI assistant with retrieval-augmented generation, persi
 |---|---|
 | **RAG over docs** | Hybrid BM25 + ChromaDB semantic retrieval over your ingested documents |
 | **Persistent memory** | Dual JSONL + ChromaDB cognitive memory with background consolidation |
-| **Image OCR** | Transcribe any `.png/.jpg/.jpeg/.gif/.webp/.bmp` URL via moondream vision model |
+| **Image OCR** | Real character-level OCR via easyocr (primary) + pix2tex LaTeX for formula regions; moondream as last-resort fallback |
 | **Audio transcription** | Transcribe audio URLs via faster-whisper (CPU tiny model, chunked via ffmpeg) |
 | **Web search** | Cascading search: SearXNG → Brave API → DuckDuckGo with page fetch |
 | **Repo intelligence** | tree-sitter AST index, code health checks, FIM completions |
-| **VS Code extension** | Sidebar panel + `@rag` chat participant + `Ctrl+Alt+Q` keybinding |
+| **VS Code extension** | Sidebar panel + `@rag` chat participant + `Ctrl+Alt+Q` keybinding; auto-starts backend on activation; 60s watchdog with LLM refusal detection + auto-restart |
+| **Agent bridge** | HTTP bridge on `:8766` (`POST /agent-query`) lets automation drive the full extension pipeline programmatically |
+| **Multi-turn chat** | Full conversation history threading in sidebar and `@rag` participant with deduplication |
 | **Background maintenance** | 50-minute rotation loop: self-diagnosis, cleanup, consolidation, health check |
 
 ---
@@ -24,7 +26,9 @@ A self-maintaining local AI assistant with retrieval-augmented generation, persi
 - **Python 3.11** + FastAPI backend on `:8765`
 - **Ollama** on `:11434` — `cograg-gpu` model (qwen3:latest 8B, 32K context)
 - **ChromaDB** — vector storage for documents and memory
-- **moondream:latest** — 1.7GB vision model for image OCR
+- **easyocr** — primary OCR engine (CRAFT+CRNN, CPU mode, `gpu=False`)
+- **pix2tex 0.1.4** — LaTeX OCR for formula-dense image regions (CPU)
+- **moondream:latest** — fallback vision model (used only when easyocr yields nothing)
 - **faster-whisper** — CPU audio transcription
 - **nomic-embed-text:latest** — embeddings (auto-unloaded after each use to free VRAM)
 - **SearXNG** (optional, via Docker) — self-hosted search frontend
@@ -61,7 +65,7 @@ Or manually:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install fastapi uvicorn ollama chromadb rank-bm25 faster-whisper requests beautifulsoup4 tree-sitter
+pip install fastapi uvicorn ollama chromadb rank-bm25 faster-whisper requests beautifulsoup4 tree-sitter easyocr pix2tex
 ollama create cograg-gpu -f Modelfile.gpu
 ```
 
@@ -89,6 +93,13 @@ code --install-extension cognitive-rag-v17-1.7.0.vsix
 ```
 
 Or install from `vscode-extension/` via `F1 → Extensions: Install from VSIX`.
+
+The extension:
+- **Auto-starts** the backend server on VS Code activation
+- **60s watchdog** heartbeat — restarts the server if it goes down
+- **LLM refusal detection** — if the model returns "can't access the internet", restarts and retries automatically
+- **Multi-turn history** — full conversation threading in sidebar and `@rag` chat participant
+- **Agent bridge** on `:8766` for programmatic access through the full extension pipeline
 
 ---
 
@@ -143,8 +154,41 @@ Store a note in persistent memory.
 {"text": "User prefers concise answers", "meta": {"source": "preference"}}
 ```
 
+### `POST /memory/store`
+Store a note in persistent memory.
+```json
+{"text": "User prefers concise answers", "meta": {"source": "preference"}}
+```
+
 ### `GET /memory/recent`
 Returns the 20 most recent memory entries.
+
+---
+
+## Agent Bridge (port 8766)
+
+The VS Code extension exposes a local HTTP bridge that routes requests through the extension's full pipeline (health-check → `/query` → refusal detection → auto-restart+retry):
+
+### `GET http://localhost:8766/agent-health`
+```json
+{"status": "ok", "extension": "cognitive-rag-v17"}
+```
+
+### `POST http://localhost:8766/agent-query`
+```json
+// Request
+{"query": "read the equations in https://example.com/image.png", "history": []}
+
+// Response — same as /query plus extension metadata
+{"answer": "...", "tools_used": ["ocr"], "memory_hits": 0, "_via": "extension-bridge"}
+```
+
+The `_retried` and `_auto_restarted` flags indicate whether the extension triggered a server restart mid-query.
+
+Use `cognitiveRag.agentSend` VS Code command to inject a query directly into the **visible** sidebar UI (user bubble + streamed response):
+```js
+vscode.commands.executeCommand("cognitiveRag.agentSend", "your query here");
+```
 
 ---
 
@@ -154,31 +198,32 @@ The backend auto-detects intent and routes to the appropriate tool:
 
 | Trigger | Tool |
 |---|---|
-| URL ending in `.png/.jpg/.jpeg/.gif/.webp/.bmp` (no other URLs) | moondream OCR |
+| URL ending in `.png/.jpg/.jpeg/.gif/.webp/.bmp` | easyocr (upscaled, contrast-boosted) + pix2tex for formula regions; moondream fallback |
 | URL ending in `.mp3/.wav/.m4a/.ogg/.flac/.opus/.webm` | faster-whisper transcription |
-| Keywords: `search`, `look up`, `what is`, `latest`, `news`, `https://` (non-image) | Web search |
+| Keywords: `search`, `look up`, `what is`, `latest`, `news`, `https://` (non-image/audio) | Web search |
 | Everything else | Hybrid RAG retrieval |
 
-OCR and audio results are injected as `[OCR: ...]` / `[TRANSCRIPT: ...]` blocks and quoted verbatim by the LLM.
+OCR results are prepended **verbatim** before the LLM answer (`**Extracted text (verbatim OCR):**`) — the LLM cannot rephrase or hallucinate them. OCR queries skip memory search and write (no pollution from image content).
 
 ---
 
 ## Project Structure
 
 ```
-server/api.py           — FastAPI app, all endpoints, tool dispatch logic
+server/api.py           — FastAPI app, all endpoints, tool dispatch, verbatim OCR prepend, memory suppression
 core/engine.py          — Inference engine, cognition_cycle(), background_loop()
 memory/brain.py         — ChromaDB + JSONL memory, consolidation, diagnosis
 graph/repo.py           — tree-sitter AST repo index, code_health_check()
 workers/retriever.py    — Hybrid BM25 + ChromaDB retrieval
-workers/websearch.py    — Web search cascade + image OCR (_ocr_image)
-workers/audio.py        — Audio transcription (faster-whisper, chunked)
-vscode-extension/       — VS Code extension (sidebar + @rag participant)
+workers/websearch.py    — Web search cascade + easyocr primary OCR + pix2tex LaTeX + moondream fallback
+workers/websearch.py    — Audio transcription (faster-whisper, chunked via ffmpeg)
+vscode-extension/       — VS Code extension (sidebar + @rag participant + agent bridge :8766)
 docs/                   — Architecture, API, and memory system docs
 versioning/             — Historical installer versions
 Modelfile.gpu           — Ollama model definition (qwen3:latest, num_ctx 32768)
 ingest.py               — Document ingestion into ChromaDB
 start_server.ps1        — Watchdog restart loop
+test_live.py            — Live end-to-end test suite (OCR + audio + multi-turn via extension bridge)
 ```
 
 ---

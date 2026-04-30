@@ -416,8 +416,11 @@ window.addEventListener("message", e => {
         " | VRAM: " + (m.mem_used_mb||"?") + "/" + (m.mem_total_mb||"?") +
         " MB | Util: " + (m.gpu_util_pct||"?") + "%";
     }
-  }
-});
+  }  // agent_inject: show a user bubble injected by the Copilot agent
+  if (m.type === "agent_inject") {
+    addMsg("user", "[agent] " + m.query);
+    setStatus('<span class="spinner"></span>agent query running...');
+  }});
 restoreRenderedHistory();
 setInterval(() => vsc.postMessage({ cmd: "gpu_status" }), 120000);
 </script>
@@ -554,9 +557,12 @@ async function handleChatRequest(request, _context, stream, token) {
 }
 
 // â”€â”€ Sidebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+let _sidebarView = null;  // live ref so agentSend can post into it
+
 function registerSidebar(context) {
   const provider = {
     resolveWebviewView(view) {
+      _sidebarView = view;
       view.webview.options = { enableScripts: true };
       view.webview.html    = getSidebarHtml(model());
 
@@ -712,11 +718,101 @@ async function ensureServerRunning(wsRoot) {
   vscode.window.showWarningMessage("Cognitive RAG: server started but health check timed out.");
 }
 
+// ─── Agent HTTP bridge (port 8766) ────────────────────────────────────────────
+// Allows the Copilot agent to send queries through the extension's full pipeline
+// (health-check → /query → refusal detection → restart+retry) via HTTP.
+// POST http://localhost:8766/agent-query  { "query": "...", "history": [...] }
+// Returns the same JSON as /query plus extension metadata.
+let _agentBridge = null;
+
+function startAgentBridge() {
+  if (_agentBridge) return;
+  const _REFUSAL = /cannot (access|view|browse|read|visit)|unable to (access|view|browse|read)|don't have (the ability|access)|can't (access|view|read)|no (internet|web) access/i;
+
+  _agentBridge = http.createServer(async (req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    if (req.method === "GET" && req.url === "/agent-health") {
+      res.end(JSON.stringify({ status: "ok", extension: "cognitive-rag-v17" }));
+      return;
+    }
+
+    if (req.method !== "POST" || req.url !== "/agent-query") {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+
+    let body = "";
+    req.on("data", c => { body += c; });
+    req.on("end", async () => {
+      let query = "", history = [];
+      try {
+        const parsed = JSON.parse(body);
+        query   = parsed.query   || "";
+        history = parsed.history || [];
+      } catch {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: "invalid JSON" }));
+        return;
+      }
+
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+
+      try {
+        // Health pre-check
+        if (!(await _checkHealth(ragUrl()))) {
+          await ensureServerRunning(ws);
+        }
+
+        const result = await httpPost(ragUrl(), "/query", { query, history });
+        const answer = result.answer || "(no answer)";
+
+        // Refusal detection — same logic as handleChatRequest
+        if (_REFUSAL.test(answer) &&
+            !result.tools_used?.includes("ocr") &&
+            !result.tools_used?.includes("web")) {
+          await ensureServerRunning(ws);
+          try {
+            const retry = await httpPost(ragUrl(), "/query", { query, history: [] });
+            res.end(JSON.stringify({ ...retry, _retried: true, _via: "extension-bridge" }));
+            return;
+          } catch {}
+        }
+
+        res.end(JSON.stringify({ ...result, _via: "extension-bridge" }));
+      } catch (err) {
+        // Connection failure → restart then retry
+        await ensureServerRunning(ws);
+        try {
+          const r2 = await httpPost(ragUrl(), "/query", { query, history });
+          res.end(JSON.stringify({ ...r2, _auto_restarted: true, _via: "extension-bridge" }));
+        } catch (err2) {
+          res.statusCode = 503;
+          res.end(JSON.stringify({ error: err2.message, tools_used: [], answer: "", memory_hits: 0 }));
+        }
+      }
+    });
+  });
+
+  _agentBridge.listen(8766, "127.0.0.1", () => {
+    // Bridge is ready on 127.0.0.1:8766
+  });
+  _agentBridge.on("error", () => {
+    // Port already in use or other error — silently ignore
+    _agentBridge = null;
+  });
+}
+
 // ─── activate ─────────────────────────────────────────────────────────────────
 function activate(context) {
   // Auto-start the backend if it's not already running
   const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (wsRoot) ensureServerRunning(wsRoot);
+
+  // Start the agent HTTP bridge on port 8766
+  startAgentBridge();
 
   // Watchdog: silently restart the server if it goes down after initial start.
   // Runs every 60 s; no user-visible message unless restart is needed.
@@ -743,6 +839,76 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("cognitiveRag.openChat", () => {
       vscode.commands.executeCommand("workbench.action.chat.open", { query: "@rag " });
+    }),
+    // agentSend: programmatically inject a query into the visible sidebar as if the user typed it
+    vscode.commands.registerCommand("cognitiveRag.agentSend", async (queryText, historyArr) => {
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+      const query   = queryText  || "";
+      const history = historyArr || [];
+      if (!query) return { error: "no query" };
+
+      // Focus the sidebar so the conversation is visible
+      await vscode.commands.executeCommand("cognitiveRag.sidebar.focus");
+      await new Promise(r => setTimeout(r, 300)); // allow view to mount
+
+      const view = _sidebarView;
+      if (!view) return { error: "sidebar not mounted" };
+
+      const post = t => view.webview.postMessage(t);
+
+      // Show the user bubble in the sidebar
+      post({ type: "agent_inject", query });
+
+      // Health pre-check
+      if (!(await _checkHealth(ragUrl()))) {
+        post({ type: "status", text: "backend offline — restarting..." });
+        await ensureServerRunning(ws);
+      }
+
+      post({ type: "stream_start" });
+      post({ type: "status", text: "running tools..." });
+
+      const _REFUSAL_AGENT = /cannot (access|view|browse|read|visit)|unable to (access|view|browse|read)|don't have (the ability|access)|can't (access|view|read)|no (internet|web) access/i;
+      try {
+        const result = await httpPost(ragUrl(), "/query", { query, history });
+        const answer = result.answer || "(no answer)";
+
+        if (_REFUSAL_AGENT.test(answer) &&
+            !result.tools_used?.includes("ocr") &&
+            !result.tools_used?.includes("web")) {
+          post({ type: "stream_chunk", text: "*Checking server and retrying…*\n\n" });
+          await ensureServerRunning(ws);
+          try {
+            const r2     = await httpPost(ragUrl(), "/query", { query, history: [] });
+            const tm2    = { web:"Web search",docs:"Hybrid RAG",diagnosis:"Self-Diagnosis",audio:"Audio transcription",ocr:"Image OCR" };
+            const badges2 = (r2.tools_used||[]).map(t=>tm2[t]||t);
+            if (r2.memory_hits>0) badges2.push(`Memory (${r2.memory_hits})`);
+            badges2.push("Model: "+model()); badges2.push("via: agent");
+            post({ type: "stream_chunk", text: r2.answer||"(no answer)" });
+            post({ type: "stream_end",   badges: badges2 });
+            return { ...r2, _via:"agentSend-retry" };
+          } catch {}
+        }
+
+        const toolMap = { web:"Web search",docs:"Hybrid RAG",diagnosis:"Self-Diagnosis",audio:"Audio transcription",ocr:"Image OCR" };
+        const badges  = (result.tools_used||[]).map(t=>toolMap[t]||t);
+        if (result.memory_hits>0) badges.push(`Memory (${result.memory_hits})`);
+        badges.push("Model: "+model()); badges.push("via: agent");
+        post({ type: "stream_chunk", text: answer });
+        post({ type: "stream_end",   badges });
+        return { ...result, _via:"agentSend" };
+      } catch (err) {
+        await ensureServerRunning(ws);
+        try {
+          const r2 = await httpPost(ragUrl(), "/query", { query, history });
+          post({ type: "stream_chunk", text: r2.answer||"(no answer)" });
+          post({ type: "stream_end",   badges: ["via: agent (restarted)"] });
+          return { ...r2, _via:"agentSend-restarted" };
+        } catch (err2) {
+          post({ type: "error", text: err2.message });
+          return { error: err2.message };
+        }
+      }
     }),
     vscode.commands.registerCommand("cognitiveRag.repoTask", async () => {
       const ws     = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -797,6 +963,57 @@ function activate(context) {
       const t  = vscode.window.createTerminal("RAG Tests");
       t.sendText(`cd "${ws}" && python -m pytest tests/ -v --tb=short`);
       t.show();
+    }),
+
+    // ── Agent-accessible query command ──────────────────────────────────────
+    // Allows the Copilot agent to communicate through the extension's full
+    // pipeline (health-check → API → refusal detection → restart+retry).
+    // Args: (query: string, historyJson?: string)
+    // Result is written to <workspace>/agent-query-result.json
+    vscode.commands.registerCommand("cognitiveRag.agentQuery", async (query, historyJson) => {
+      const ws          = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+      const resultPath  = path.join(ws, "agent-query-result.json");
+      const history     = (() => {
+        try { return historyJson ? JSON.parse(historyJson) : []; } catch { return []; }
+      })();
+      const _REFUSAL    = /cannot (access|view|browse|read|visit)|unable to (access|view|browse|read)|don't have (the ability|access)|can't (access|view|read)|no (internet|web) access/i;
+
+      const writeResult = obj => {
+        try { fs.writeFileSync(resultPath, JSON.stringify(obj, null, 2), "utf8"); } catch {}
+      };
+
+      try {
+        // Health pre-check — same as sidebar handler
+        if (!(await _checkHealth(ragUrl()))) {
+          await ensureServerRunning(ws);
+        }
+
+        const result = await httpPost(ragUrl(), "/query", { query, history });
+        const answer = result.answer || "(no answer)";
+
+        // Refusal detection — same as handleChatRequest
+        if (_REFUSAL.test(answer) &&
+            !result.tools_used?.includes("ocr") &&
+            !result.tools_used?.includes("web")) {
+          await ensureServerRunning(ws);
+          try {
+            const retry = await httpPost(ragUrl(), "/query", { query, history: [] });
+            writeResult({ ...retry, _retried: true });
+            return;
+          } catch {}
+        }
+
+        writeResult(result);
+      } catch (err) {
+        // Auto-restart on connection failure then retry once
+        await ensureServerRunning(ws);
+        try {
+          const r2 = await httpPost(ragUrl(), "/query", { query, history });
+          writeResult({ ...r2, _auto_restarted: true });
+        } catch (err2) {
+          writeResult({ error: err2.message, tools_used: [], answer: "", memory_hits: 0 });
+        }
+      }
     })
   );
 
@@ -807,5 +1024,6 @@ function activate(context) {
 
 function deactivate() {
   if (_serverProc) { _serverProc.kill(); _serverProc = null; }
+  if (_agentBridge) { _agentBridge.close(); _agentBridge = null; }
 }
 module.exports = { activate, deactivate };

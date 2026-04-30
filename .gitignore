@@ -19,6 +19,11 @@ chroma_db/
 memory/chroma_mem/
 memory/cognition.jsonl
 
+# Node
+node_modules/
+vscode-extension/node_modules/
+vscode-extension/package-lock.json
+
 # VS Code
 .vscode/
 
@@ -35,3 +40,9 @@ Thumbs.db
 # Logs / temp
 *.log
 *.tmp
+uvicorn.err
+uvicorn_err.txt
+
+# Runtime artifacts
+bm25_index.pkl
+*.vsix
