@@ -29,6 +29,44 @@ def _get_easyocr_reader():
         _easyocr_reader = _easyocr.Reader(["en"], gpu=False, verbose=False)
     return _easyocr_reader
 
+# Cached pix2tex LatexOCR model (loaded once on first math OCR use)
+_pix2tex_model = None
+
+def _get_pix2tex_model():
+    global _pix2tex_model
+    if _pix2tex_model is None:
+        from pix2tex.cli import LatexOCR
+        _pix2tex_model = LatexOCR()
+    return _pix2tex_model
+
+# Heuristic: does this easyocr text look like it contains significant math?
+# Triggers pix2tex pass when true.
+_MATH_SIGNALS = re.compile(
+    r'[∑∏∫√∞±≈≠≤≥αβγδεζθλμπρσφψω]'   # unicode math symbols
+    r'|[A-Za-z]\s*[\(\[]\s*\d'          # f(2), C(n ...
+    r'|\b(exp|ln|log|sin|cos|tan|lim|sum|int|frac|sqrt|nabla)\b'
+    r'|\d+\s*[²³⁴⁵⁶⁷⁸⁹ⁿ]'             # superscripts
+    r'|\^[\{\d]'                          # ^ exponent notation
+    r'|[\+\-\*\/=]\s*[A-Za-z]\s*[\(\[]' # operators before variables
+    r'|dimensionless|Fibonacci|Equation|Framework|Unified|entropy',
+    re.IGNORECASE
+)
+
+# Stricter formula-only signals used for per-cluster pix2tex gating.
+# Must contain actual operator/symbol characters, not just domain words.
+_FORMULA_SIGNALS = re.compile(
+    r'[=\+\*/^]'                      # operators (minus excluded — too common in text)
+    r'|[A-Za-z]\([A-Za-z0-9_,]+\)'   # f(x), C(n), E(Fn)
+    r'|[A-Za-z]\^[\d\{]'             # x^2, F^{n}
+    r'|\d+\s*/\s*\d+'                 # 1/2 fractions
+    r'|[∑∏∫√∞±≈≠≤≥αβγδεζθλμπρσφψω]' # unicode math symbols
+    r'|\\\w+\{',                       # LaTeX-style \cmd{
+    re.IGNORECASE
+)
+
+def _is_math_heavy(text: str) -> bool:
+    return len(_MATH_SIGNALS.findall(text)) >= 3
+
 def _strip_html(raw: str) -> str:
     raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
     raw = re.sub(r"<style[^>]*>.*?</style>",   "", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -278,6 +316,69 @@ def _ocr_image(img_url: str) -> str:
 
                 text = "\n".join(lines).strip()
                 if text:
+                    # --- Secondary: pix2tex LaTeX pass (math/physics images) ---
+                    # pix2tex works on tight-cropped formula regions, NOT full pages.
+                    # Build clusters of bounding boxes with math-dense content,
+                    # crop each, run pix2tex only on regions that are formula-heavy.
+                    if _is_math_heavy(text):
+                        try:
+                            _latex_parts = []
+                            img_w, img_h = img.size
+
+                            # Group easyocr detections into vertical clusters
+                            # Each cluster: list of (bbox, word, conf)
+                            clusters = []
+                            cur_cluster = []
+                            cur_y = None
+                            for item in results:
+                                bbox, word, conf = item
+                                y_c = (bbox[0][1] + bbox[2][1]) / 2
+                                if cur_y is None or abs(y_c - cur_y) < 60:
+                                    cur_cluster.append(item)
+                                    cur_y = y_c if cur_y is None else (cur_y + y_c) / 2
+                                else:
+                                    clusters.append(cur_cluster)
+                                    cur_cluster = [item]
+                                    cur_y = y_c
+                            if cur_cluster:
+                                clusters.append(cur_cluster)
+
+                            for cluster in clusters:
+                                words = [w for _, w, _ in cluster]
+                                math_ratio = sum(1 for w in words if _FORMULA_SIGNALS.search(w)) / max(len(words), 1)
+                                # Only crop regions where ≥50% of words are formula-like
+                                if math_ratio < 0.5:
+                                    continue
+                                xs = [p[0] for b, _, _ in cluster for p in b]
+                                ys = [p[1] for b, _, _ in cluster for p in b]
+                                pad = 14
+                                x0 = max(0, int(min(xs)) - pad)
+                                y0 = max(0, int(min(ys)) - pad)
+                                x1 = min(img_w, int(max(xs)) + pad)
+                                y1 = min(img_h, int(max(ys)) + pad)
+                                if (x1 - x0) < 20 or (y1 - y0) < 12:
+                                    continue
+                                crop = img.crop((x0, y0, x1, y1))
+                                if crop.height < 32:
+                                    crop = crop.resize(
+                                        (crop.width * 2, crop.height * 2),
+                                        _PILImage.LANCZOS
+                                    )
+                                try:
+                                    latex = _get_pix2tex_model()(crop)
+                                    if latex and len(latex.strip()) > 4:
+                                        _latex_parts.append(latex.strip())
+                                except Exception:
+                                    pass
+
+                            if _latex_parts:
+                                text = (
+                                    text
+                                    + "\n\n[LaTeX (pix2tex — formula regions)]\n"
+                                    + "\n".join(_latex_parts)
+                                )
+                        except Exception:
+                            pass  # pix2tex failure is non-fatal
                     return text
         except Exception:
             pass

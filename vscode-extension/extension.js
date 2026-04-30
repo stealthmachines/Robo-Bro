@@ -419,7 +419,7 @@ window.addEventListener("message", e => {
   }
 });
 restoreRenderedHistory();
-setInterval(() => vsc.postMessage({ cmd: "gpu_status" }), 30000);
+setInterval(() => vsc.postMessage({ cmd: "gpu_status" }), 120000);
 </script>
 </body>
 </html>`;
