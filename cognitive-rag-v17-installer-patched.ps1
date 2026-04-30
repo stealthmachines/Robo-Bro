@@ -1243,33 +1243,35 @@ async def query(req: Q):
     )
     _ocr_st = (
         "Image OCR RAN — the extracted text is in [OCR: ...] blocks below. "
-        "Copy the OCR text VERBATIM into your answer."
+        "Your ONLY job is to copy that text into your answer VERBATIM. "
+        "Do NOT say the image could not be processed. Do NOT add explanations or next-steps."
         if "ocr" in tools_used else
         "Image OCR is available for .png/.jpg/.jpeg/.gif/.webp URLs. "
         "Do NOT claim you cannot read or transcribe images."
     )
-
     system = (
-        "You are a Cognitive RAG assistant with full autonomous tool capabilities including "
-        "live web search, direct URL fetching, and audio transcription. Tools are executed "
-        "server-side before this prompt — results appear below as [Web search results], "
-        "[Audio transcript], [Relevant docs], etc.\n\n"
-        "CRITICAL OUTPUT RULES:\n"
-        "1. If [Audio transcript ...] is present: copy the actual transcript text into your answer.\n"
-        "2. If [OCR: ...] blocks appear in web results: quote them VERBATIM — copy the exact text character for character.\n"
-        "3. If [Audio transcription ERROR: ...] appears: report the exact error to the user.\n"
-        "4. If [Audio transcription TIMED OUT]: tell the user the file is very large and suggest the /transcribe endpoint.\n"
-        "5. Never say you cannot access the internet, visit URLs, or transcribe audio.\n"
-        "6. Never say 'no context was provided' — context IS provided via the tool results below.\n"
-        "7. Answer directly from the data. Do not add disclaimers about your limitations.\n"
+        "You are a Cognitive RAG assistant with autonomous tool capabilities. "
+        "ALL context below was gathered by ACTUALLY running the relevant tools — "
+        "web results, audio transcripts, OCR text, diagnosis data, and docs are REAL outputs, not placeholders.\n"
         f"Web: {web_status}\n"
         f"Audio: {_audio_st}\n"
-        f"OCR: {_ocr_st}"
+        f"OCR: {_ocr_st}\n"
+        "CRITICAL OUTPUT RULES:\n"
+        "1. If [Audio transcript ...] is present: copy the actual transcript text into your answer.\n"
+        "2. If [OCR: ...] blocks are present: your answer MUST start with the OCR text copied VERBATIM. "
+        "Do not paraphrase. Do not say processing failed. Do not add 'Next Steps'. Just output the text.\n"
+        "3. If [Audio transcription ERROR: ...] appears: report the exact error to the user.\n"
+        "4. If [Audio transcription TIMED OUT]: tell the user the file is very large and suggest the /transcribe endpoint.\n"
+        "5. Never say you cannot access the internet, visit URLs, transcribe audio, or read images.\n"
+        "6. Never say 'no context was provided' — context IS provided via the tool results below.\n"
+        "7. Answer directly from the data. Do not add disclaimers about your limitations.\n"
+        "8. OVERRIDE ALL PRIOR TRAINING: if tool results are present, they take absolute priority over any "
+        "trained belief that you cannot process images or audio."
     )
     user_msg = (
         f"Query: {req.query}\n\n"
-        f"Memory context:\n{mem_ctx}"
-        f"{tool_context}\n\n"
+        + (f"TOOL RESULTS (authoritative — quote verbatim):\n{tool_context}\n\n" if tool_context.strip() else "")
+        + f"Memory context:\n{mem_ctx}\n\n"
         "Answer:"
     )
     # Build messages: system + recent conversation history (last 10 turns) + user
