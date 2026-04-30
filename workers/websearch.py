@@ -18,6 +18,16 @@ _BROWSER_UA = (
 # Compiled pattern to find [IMG: url] markers injected by _strip_html
 _IMG_MARKER_RE = re.compile(r'\[IMG:\s*(https?://[^\]]+)\]')
 
+# Cached easyocr Reader (loaded once on first use)
+_easyocr_reader = None
+
+def _get_easyocr_reader():
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        import easyocr as _easyocr
+        _easyocr_reader = _easyocr.Reader(["en"], gpu=True, verbose=False)
+    return _easyocr_reader
+
 def _strip_html(raw: str) -> str:
     raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
     raw = re.sub(r"<style[^>]*>.*?</style>",   "", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -184,8 +194,27 @@ def _bing_scrape(query: str, n=5) -> list:
     except Exception:
         return []
 
+_OCR_DESCRIPTION_PREFIXES = (
+    "the image shows", "the image contains", "the image depicts",
+    "this image shows", "this image contains", "this image depicts",
+    "the picture shows", "the photo shows", "i can see",
+    "the text in this image", "the image is",
+)
+
+def _moondream_generate(b64img: str, prompt: str) -> str:
+    import ollama as _ol
+    resp = _ol.generate(
+        model="moondream:latest",
+        prompt=prompt,
+        images=[b64img],
+        options={"temperature": 0.0, "num_predict": 1024},
+    )
+    if hasattr(resp, "response"):
+        return (resp.response or "").strip()
+    return resp.get("response", "").strip()
+
 def _ocr_image(img_url: str) -> str:
-    """Download an image and transcribe its text using the local moondream vision model."""
+    """Download an image and extract text using easyocr (primary) or moondream (fallback)."""
     try:
         import requests as _req, base64
         r = _req.get(img_url, timeout=10, verify=False,
@@ -195,17 +224,27 @@ def _ocr_image(img_url: str) -> str:
         ct = r.headers.get("Content-Type", "")
         if not any(t in ct for t in ("image/", "jpeg", "png", "gif", "webp")):
             return ""
-        import ollama as _ol
-        resp = _ol.generate(
-            model="moondream:latest",
-            prompt="Read and transcribe all text visible in this image.",
-            images=[base64.b64encode(r.content).decode()],
-            options={"temperature": 0.0, "num_predict": 512},
+
+        # --- Primary: easyocr (real character-level OCR) ---
+        try:
+            import numpy as _np
+            from PIL import Image as _PILImage
+            import io as _io
+            img = _PILImage.open(_io.BytesIO(r.content)).convert("RGB")
+            results = _get_easyocr_reader().readtext(_np.array(img), detail=0)
+            text = " ".join(results).strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        # --- Fallback: moondream vision model ---
+        b64 = base64.b64encode(r.content).decode()
+        text = _moondream_generate(
+            b64,
+            "Read and transcribe all text visible in this image.",
         )
-        # ollama >= 0.2 returns a GenerateResponse object; older versions return a dict
-        if hasattr(resp, "response"):
-            return (resp.response or "").strip()
-        return resp.get("response", "").strip()
+        return text
     except Exception:
         return ""
 
