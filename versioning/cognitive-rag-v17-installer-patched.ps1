@@ -1376,14 +1376,21 @@ async def query(req: Q):
         for u in _re.findall(r'https?://\S+', _all_text)
         if any(u.lower().rstrip('.,;)"\''). endswith(ext) for ext in _IMAGE_EXT)
     ]
-    # Pure image query = has image URLs, no audio, and no non-image URLs also present
-    _non_image_urls = [
-        u for u in _re.findall(r'https?://\S+', _all_text)
+    # Pure image query: evaluate on CURRENT QUERY ONLY (not history) to avoid
+    # history non-image URLs defeating the guard.
+    _query_urls = _re.findall(r'https?://\S+', req.query)
+    _query_img_urls = [
+        u.rstrip('.,;)"\'')
+        for u in _query_urls
+        if any(u.lower().rstrip('.,;)"\''). endswith(ext) for ext in _IMAGE_EXT)
+    ]
+    _query_non_img_urls = [
+        u for u in _query_urls
         if not any(u.lower().rstrip('.,;)"\''). endswith(ext) for ext in _IMAGE_EXT)
     ]
-    _is_pure_image_query = bool(_direct_img_urls) and not any(
-        ext in _all_text.lower() for ext in _AUDIO_EXT
-    ) and not _non_image_urls
+    _is_pure_image_query = bool(_query_img_urls) and not any(
+        ext in req.query.lower() for ext in _AUDIO_EXT
+    ) and not _query_non_img_urls
     if (any(t in q_lower for t in _WEB_TRIGGERS) or any(t in _all_text.lower() for t in ("https://", "http://"))) and not _is_pure_image_query:
         _web_query = req.query
         if not _re.search(r'https?://', req.query):

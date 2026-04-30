@@ -84,20 +84,27 @@ async def query(req: Q):
     _all_text = req.query + " " + _history_text
 
     # ── Intent: web search ────────────────────────────────────────────────────
-    # Skip web search if the query is purely a direct image URL (handled by OCR route below)
+    # Collect image URLs from full text (query + history) for OCR route
     _direct_img_urls = [
         u.rstrip('.,;)"\'')
         for u in _re.findall(r'https?://\S+', _all_text)
         if any(u.lower().rstrip('.,;)"\'').endswith(ext) for ext in _IMAGE_EXT)
     ]
-    # Pure image query = has image URLs, no audio, and no non-image URLs also present
-    _non_image_urls = [
-        u for u in _re.findall(r'https?://\S+', _all_text)
+    # Pure image query: evaluate on CURRENT QUERY ONLY (not history) to avoid
+    # history non-image URLs defeating the guard.
+    _query_urls = _re.findall(r'https?://\S+', req.query)
+    _query_img_urls = [
+        u.rstrip('.,;)"\'')
+        for u in _query_urls
+        if any(u.lower().rstrip('.,;)"\'').endswith(ext) for ext in _IMAGE_EXT)
+    ]
+    _query_non_img_urls = [
+        u for u in _query_urls
         if not any(u.lower().rstrip('.,;)"\'').endswith(ext) for ext in _IMAGE_EXT)
     ]
-    _is_pure_image_query = bool(_direct_img_urls) and not any(
-        ext in _all_text.lower() for ext in _AUDIO_EXT
-    ) and not _non_image_urls
+    _is_pure_image_query = bool(_query_img_urls) and not any(
+        ext in req.query.lower() for ext in _AUDIO_EXT
+    ) and not _query_non_img_urls
     if (any(t in q_lower for t in _WEB_TRIGGERS) or any(t in _all_text.lower() for t in ("https://", "http://"))) and not _is_pure_image_query:
         # Use full query for current call; if follow-up, inject prior URL into search query
         _web_query = req.query
