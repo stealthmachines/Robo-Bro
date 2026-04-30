@@ -360,10 +360,10 @@ function send() {
   if (!q) return;
   document.getElementById("q").value = "";
   responding = true;
+  // Build history BEFORE addMsg so current query is not doubled (it is sent as the query field)
+  const hist = history.slice(-10).map(m => ({ role: m.role === "ai" ? "assistant" : "user", content: m.content }));
   addMsg("user", q);
   setStatus('<span class="spinner"></span>thinking...');
-  // Include last 10 turns as conversation history for multi-turn context
-  const hist = history.slice(-10).map(m => ({ role: m.role === "ai" ? "assistant" : "user", content: m.content }));
   vsc.postMessage({ cmd: "query", query: q, tools: [...activeTools], history: hist });
 }
 function sendCmd(cmd) {
@@ -472,8 +472,14 @@ async function handleChatRequest(request, _context, stream, token) {
   // Build history from VS Code chat context (previous turns in this conversation)
   const chatHistory = (_context.history || []).flatMap(turn => {
     const msgs = [];
-    if (turn.participant) msgs.push({ role: "assistant", content: turn.response?.map(r => r.value || "").join("") || "" });
-    if (turn.prompt)      msgs.push({ role: "user",      content: turn.prompt });
+    if (turn.response !== undefined) {
+      // ChatResponseTurn: r.value is a MarkdownString — extract .value (the string)
+      const content = (turn.response || []).map(r =>
+        r.value?.value ?? (typeof r.value === "string" ? r.value : String(r.value || ""))
+      ).join("");
+      msgs.push({ role: "assistant", content });
+    }
+    if (turn.prompt !== undefined) msgs.push({ role: "user", content: turn.prompt });
     return msgs;
   }).filter(m => m.content).slice(-10);
   try {
@@ -603,11 +609,37 @@ function registerSidebar(context) {
         // Default query — route through agentic /query for tool dispatch
         const q = msg.query;
         if (!q) return;
+
+        // Health pre-check: restart server before sending query (avoids refusal on cold start)
+        if (!(await _checkHealth(ragUrl()))) {
+          post({ type: "status", text: "backend offline — restarting..." });
+          await ensureServerRunning(ws);
+        }
+
         post({ type: "stream_start" });
         post({ type: "status", text: "running tools..." });
+        const _REFUSAL_SB = /cannot (access|view|browse|read|visit)|unable to (access|view|browse|read)|don't have (the ability|access)|can't (access|view|read)|no (internet|web) access/i;
         try {
           const result = await httpPost(ragUrl(), "/query", { query: q, history: msg.history || [] });
           const answer = result.answer || "(no answer)";
+
+          // Detect LLM refusal and retry once after server check
+          if (_REFUSAL_SB.test(answer) && !result.tools_used?.includes("ocr") && !result.tools_used?.includes("web")) {
+            post({ type: "stream_chunk", text: "*Checking server and retrying…*\n\n" });
+            await ensureServerRunning(ws);
+            try {
+              const r2 = await httpPost(ragUrl(), "/query", { query: q, history: [] });
+              const a2 = r2.answer || "(no answer)";
+              const tm2 = { web: "Web search", docs: "Hybrid RAG", diagnosis: "Self-Diagnosis", audio: "Audio transcription", ocr: "Image OCR" };
+              const b2 = (r2.tools_used || []).map(t => tm2[t] || t);
+              if (r2.memory_hits > 0) b2.push(`Memory (${r2.memory_hits})`);
+              b2.push("Model: " + model());
+              post({ type: "stream_chunk", text: a2 });
+              post({ type: "stream_end",   badges: b2 });
+              return;
+            } catch {}
+          }
+
           const toolMap = { web: "Web search", docs: "Hybrid RAG",
                             diagnosis: "Self-Diagnosis", audio: "Audio transcription",
                             ocr: "Image OCR" };
