@@ -14,7 +14,7 @@ function model()       { return cfg("model")       || "cograg-gpu"; }
 function inlineDelay() { return cfg("inlineDelay") ?? 350; }
 
 // â”€â”€ HTTP helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-function httpPost(baseUrl, endpoint, body) {
+function httpPost(baseUrl, endpoint, body, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
     const parsed  = new URL(baseUrl + endpoint);
@@ -25,7 +25,8 @@ function httpPost(baseUrl, endpoint, body) {
       path:     parsed.pathname,
       method:   "POST",
       headers:  { "Content-Type": "application/json",
-                  "Content-Length": Buffer.byteLength(payload) }
+                  "Content-Length": Buffer.byteLength(payload) },
+      timeout:  timeoutMs
     };
     const req = lib.request(opts, res => {
       let data = "";
@@ -33,6 +34,10 @@ function httpPost(baseUrl, endpoint, body) {
       res.on("end", () => {
         try { resolve(JSON.parse(data)); } catch { resolve({ error: data }); }
       });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`Request timed out after ${timeoutMs / 1000}s — server may still be loading the model. Try again in a moment.`));
     });
     req.on("error", reject);
     req.write(payload);
@@ -41,7 +46,7 @@ function httpPost(baseUrl, endpoint, body) {
 }
 
 // FIX-12: GPU status uses correct GET method
-function httpGet(baseUrl, endpoint) {
+function httpGet(baseUrl, endpoint, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(baseUrl + endpoint);
     const lib    = parsed.protocol === "https:" ? https : http;
@@ -49,7 +54,8 @@ function httpGet(baseUrl, endpoint) {
       hostname: parsed.hostname,
       port:     parsed.port || (parsed.protocol === "https:" ? 443 : 80),
       path:     parsed.pathname,
-      method:   "GET"
+      method:   "GET",
+      timeout:  timeoutMs
     };
     const req = lib.request(opts, res => {
       let data = "";
@@ -58,6 +64,7 @@ function httpGet(baseUrl, endpoint) {
         try { resolve(JSON.parse(data)); } catch { resolve({ error: data }); }
       });
     });
+    req.on("timeout", () => { req.destroy(); reject(new Error("HTTP GET timed out")); });
     req.on("error", reject);
     req.end();
   });
