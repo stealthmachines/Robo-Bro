@@ -283,7 +283,7 @@ button{padding:4px 10px;font-size:11px;border-radius:3px;cursor:pointer;
 <body>
 <div class="header">
   <div class="model-badge"><div class="dot"></div>${currentModel}</div>
-  <span style="font-size:10px;color:var(--vscode-descriptionForeground)">local Â· GPU</span>
+  <span style="font-size:10px;color:var(--vscode-descriptionForeground)">local &middot; GPU</span>
 </div>
 <div class="history" id="history"></div>
 <div class="tools-row" id="tools-row">
@@ -292,7 +292,7 @@ button{padding:4px 10px;font-size:11px;border-radius:3px;cursor:pointer;
   <div class="tchip"    data-tool="web"  onclick="toggleTool(this)">Web search</div>
   <div class="tchip on" data-tool="mem"  onclick="toggleTool(this)">Memory</div>
 </div>
-<div class="gpu-bar" id="gpu-bar">â¬¡ GPU: checking...</div>
+<div class="gpu-bar" id="gpu-bar">&#x25A3; GPU: checking...</div>
 <div class="input-area">
   <textarea id="q"
     placeholder="Ask about your codebase, docs, or describe a multi-file task..."
@@ -370,8 +370,15 @@ function send() {
   // Build history BEFORE addMsg so current query is not doubled (it is sent as the query field)
   const hist = history.slice(-10).map(m => ({ role: m.role === "ai" ? "assistant" : "user", content: m.content }));
   addMsg("user", q);
-  setStatus('<span class="spinner"></span>thinking...');
-  vsc.postMessage({ cmd: "query", query: q, tools: [...activeTools], history: hist });
+  // Elapsed timer so the user can see progress during slow model inference
+  let _elapsed = 0;
+  const _timer = setInterval(() => {
+    _elapsed++;
+    setStatus('<span class="spinner"></span>running tools... ' + _elapsed + 's');
+  }, 1000);
+  setStatus('<span class="spinner"></span>running tools...');
+  vsc.postMessage({ cmd: "query", query: q, tools: [...activeTools], history: hist, _timer_ref: _timer });
+  window._pendingTimer = _timer;
 }
 function sendCmd(cmd) {
   const q = document.getElementById("q").value.trim();
@@ -393,6 +400,7 @@ window.addEventListener("message", e => {
   }
   if (m.type === "stream_chunk") appendToStreaming(m.text);
   if (m.type === "stream_end") {
+    if (window._pendingTimer) { clearInterval(window._pendingTimer); window._pendingTimer = null; }
     const streamEl = document.getElementById("ai-streaming");
     if (streamEl) {
       history.push({ role: "ai", content: streamEl.textContent }); saveState();
@@ -411,15 +419,16 @@ window.addEventListener("message", e => {
   }
   if (m.type === "status") setStatus(m.text);
   if (m.type === "error") {
+    if (window._pendingTimer) { clearInterval(window._pendingTimer); window._pendingTimer = null; }
     addMsg("ai", "Error: " + m.text);
     responding = false; setStatus("error");
   }
-  if (m.type === "gpu_update") {
+    if (m.type === "gpu_update") {
     const bar = document.getElementById("gpu-bar");
     if (m.error) {
-      bar.textContent = "â¬¡ GPU: " + m.error;
+      bar.textContent = "\u25A3 GPU: " + m.error;
     } else {
-      bar.textContent = "â¬¡ " + (m.name||"GPU") +
+      bar.textContent = "\u25A3 " + (m.name||"GPU") +
         " | VRAM: " + (m.mem_used_mb||"?") + "/" + (m.mem_total_mb||"?") +
         " MB | Util: " + (m.gpu_util_pct||"?") + "%";
     }

@@ -303,28 +303,34 @@ OK "memory/brain.py"
 Step "Writing cognition engine"
 $eng = @"
 """
-FIX-7: MODEL_GPU defined as a proper module-level name so api.py can import it.
+FIX-7:  MODEL_GPU defined as a proper module-level name so api.py can import it.
+FIX-19: cognition_cycle acquires _ollama_sem once for both calls (was twice,
+        risking 600s deadlock). Background loop uses 60s _chat timeout.
 """
-import asyncio, json, time, traceback, urllib.request
+import asyncio, json, os, traceback, urllib.request
 from memory.brain import write, search
 
 MODEL_GPU = "$MODEL_GPU"
-MODEL_RAW = "$MODEL"
+MODEL_RAW = "qwen3:latest"
 MODEL     = MODEL_GPU   # alias used internally
 
 STATE = {"cycle": 0, "running": True}
 
-def _chat(messages, temp=0.1, model=None):
+# One concurrent Ollama request. Background loop checks locked() before acquiring.
+_ollama_sem = asyncio.Semaphore(1)
+
+def _chat(messages, temp=0.1, model=None, timeout=180):
     m    = model or MODEL
     body = json.dumps({
-        "model": m, "messages": messages, "stream": False,
-        "options": {"temperature": temp, "num_ctx": 8192}
+        "model": m, "messages": messages, "stream": False, "think": False,
+        "keep_alive": "30m",
+        "options": {"temperature": temp, "num_ctx": 4096}
     }).encode()
     req = urllib.request.Request(
         "http://localhost:11434/api/chat", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read()).get("message", {}).get("content", "")
     except Exception as e:
         return f"[ollama error: {e}]"
@@ -335,28 +341,41 @@ async def cognition_cycle(query: str) -> dict:
     write({"event": "cycle_start", "cycle": cid, "query": query})
     hits = search(query, n=3)
     mem  = "\n".join(json.dumps(h) for h in hits) if hits else "none"
-    reasoning = await asyncio.to_thread(_chat, [
-        {"role": "system", "content": "You are a concise reasoning engine."},
-        {"role": "user",   "content": f"Query: {query}\nMemory:\n{mem}\nAnswer concisely."}
-    ])
-    reflection = await asyncio.to_thread(_chat, [
-        {"role": "user", "content": f"One sentence to remember: Q={query} A={reasoning[:200]}"}
-    ], 0.2)
+    # Single acquisition covers both reasoning + reflection — avoids releasing
+    # between calls which would let background probes starve user queries
+    async with _ollama_sem:
+        reasoning = await asyncio.to_thread(_chat, [
+            {"role": "system", "content": "You are a concise reasoning engine."},
+            {"role": "user",   "content": f"Query: {query}\nMemory:\n{mem}\nAnswer concisely."}
+        ], 0.1, None, 60)
+        reflection = await asyncio.to_thread(_chat, [
+            {"role": "user", "content": f"One sentence to remember: Q={query} A={reasoning[:200]}"}
+        ], 0.2, None, 60)
     write({"event": "cycle_end", "cycle": cid, "query": query,
            "reasoning": reasoning, "reflection": reflection})
     return {"cycle": cid, "query": query, "reasoning": reasoning,
             "reflection": reflection, "memory_hits": len(hits)}
 
 async def background_loop():
-    probes = ["What patterns emerged?", "What knowledge gaps exist?", "What changed recently?"]
+    probes = [
+        "What patterns emerged from recent queries and what do they suggest?",
+        "What knowledge gaps exist in the memory store that should be filled?",
+        "What changed recently across the codebase and what does it imply?",
+    ]
     i = 0
     while STATE["running"]:
+        await asyncio.sleep(300)
+        if not STATE["running"]:
+            break
+        if _ollama_sem.locked():
+            write({"event": "loop_skip", "reason": "ollama busy"})
+            i += 1
+            continue
         try:
             await cognition_cycle(probes[i % 3])
-            i += 1
         except Exception as e:
             write({"event": "loop_error", "error": str(e), "trace": traceback.format_exc()})
-        await asyncio.sleep(90)
+        i += 1
 
 async def run(query: str) -> dict:
     return await cognition_cycle(query)

@@ -12,7 +12,7 @@ import asyncio, json, os, traceback, urllib.request
 from memory.brain import write, search
 
 MODEL_GPU = "cograg-gpu"
-MODEL_RAW = "qwen3.6:latest"
+MODEL_RAW = "qwen3:latest"
 MODEL     = MODEL_GPU   # alias used internally
 
 STATE = {"cycle": 0, "running": True}
@@ -21,7 +21,7 @@ STATE = {"cycle": 0, "running": True}
 # background probes skip if the semaphore is already held.
 _ollama_sem = asyncio.Semaphore(1)
 
-def _chat(messages, temp=0.1, model=None):
+def _chat(messages, temp=0.1, model=None, timeout=180):
     m    = model or MODEL
     body = json.dumps({
         "model": m, "messages": messages, "stream": False, "think": False,
@@ -32,7 +32,7 @@ def _chat(messages, temp=0.1, model=None):
         "http://localhost:11434/api/chat", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=300) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read()).get("message", {}).get("content", "")
     except Exception as e:
         return f"[ollama error: {e}]"
@@ -43,15 +43,16 @@ async def cognition_cycle(query: str) -> dict:
     write({"event": "cycle_start", "cycle": cid, "query": query})
     hits = search(query, n=3)
     mem  = "\n".join(json.dumps(h) for h in hits) if hits else "none"
+    # Single semaphore acquisition for both reasoning + reflection —
+    # avoids releasing between calls which could block a waiting user query
     async with _ollama_sem:
         reasoning = await asyncio.to_thread(_chat, [
             {"role": "system", "content": "You are a concise reasoning engine."},
             {"role": "user",   "content": f"Query: {query}\nMemory:\n{mem}\nAnswer concisely."}
-        ])
-    async with _ollama_sem:
+        ], 0.1, None, 60)
         reflection = await asyncio.to_thread(_chat, [
             {"role": "user", "content": f"One sentence to remember: Q={query} A={reasoning[:200]}"}
-        ], 0.2)
+        ], 0.2, None, 60)
     write({"event": "cycle_end", "cycle": cid, "query": query,
            "reasoning": reasoning, "reflection": reflection})
     return {"cycle": cid, "query": query, "reasoning": reasoning,
@@ -113,15 +114,18 @@ async def background_loop():
 
             elif task == "health_check":
                 report = await asyncio.to_thread(code_health_check, WORKSPACE)
-                # Ask the model to narrate its own health report
-                async with _ollama_sem:
-                    commentary = await asyncio.to_thread(_chat, [{
-                        "role": "user",
-                        "content": (
-                            f"Code health report for this project: {json.dumps(report)}. "
-                            "In one sentence, what is the most important thing to address?"
-                        )
-                    }])
+                # Only ask model if sem is free — don't block for this commentary
+                if not _ollama_sem.locked():
+                    async with _ollama_sem:
+                        commentary = await asyncio.to_thread(_chat, [{
+                            "role": "user",
+                            "content": (
+                                f"Code health report for this project: {json.dumps(report)}. "
+                                "In one sentence, what is the most important thing to address?"
+                            )
+                        }], 0.1, None, 60)
+                else:
+                    commentary = "(skipped — Ollama busy)"
                 write({"event": "loop_health_check", "report": report,
                        "commentary": commentary})
 
